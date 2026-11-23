@@ -1,0 +1,536 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Helper ----------
+    function signedIn() { return request.auth != null; }
+    function userDoc() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+    function role() { return userDoc().data.role; }
+    function isAdmin()  { return signedIn() && role() == 'admin'; }
+    function isMentor() { return signedIn() && role() == 'mentor'; }
+    function isMentee() { return signedIn() && role() == 'mentee'; }
+    function isOwner(uid) { return signedIn() && request.auth.uid == uid; }
+    function isVerifiedMentor() {
+      return isMentor() &&
+        get(/databases/$(database)/documents/mentor_profiles/$(request.auth.uid))
+          .data.verification_status == 'verified';
+    }
+    function bookingSlotPath(scheduleId) {
+      return /databases/$(database)/documents/mentor_schedules/$(scheduleId);
+    }
+    function validPublicMentorProfile(data) {
+      return data.keys().hasOnly([
+          'name', 'university', 'major', 'experience', 'expertise',
+          'description', 'verification_status'
+        ])
+        && data.name is string
+        && data.expertise is string
+        && data.description is string
+        && data.verification_status in ['pending', 'verified', 'rejected'];
+    }
+    function bookingContactPath(bookingId) {
+      return /databases/$(database)/documents/booking_contacts/$(bookingId);
+    }
+    function mentorContactPath(uid) {
+      return /databases/$(database)/documents/mentor_contact_profiles/$(uid);
+    }
+    function heldSlotReleased(bookingId) {
+      let scheduleId = resource.data.schedule_id;
+      let slotPath = bookingSlotPath(scheduleId);
+      let slot = get(slotPath);
+      let updatedSlot = getAfter(slotPath);
+      return scheduleId is string
+        && (
+          !exists(slotPath)
+          || slot.data.current_booking_id != bookingId
+          || !(slot.data.availability_status in ['held', 'booked'])
+          || (
+            existsAfter(slotPath)
+            && updatedSlot.data.availability_status == 'available'
+            && !updatedSlot.data.keys().hasAny(['current_booking_id'])
+          )
+        );
+    }
+    function reservesSlotForBooking(scheduleId) {
+      let bookingId = request.resource.data.current_booking_id;
+      let bookingPath = /databases/$(database)/documents/bookings/$(bookingId);
+      return signedIn()
+        && bookingId is string
+        && isMentee()
+        && resource.data.availability_status == 'available'
+        && request.resource.data.availability_status == 'held'
+        && request.resource.data.mentor_user_id == resource.data.mentor_user_id
+        && existsAfter(bookingPath)
+        && getAfter(bookingPath).data.booking_status == 'pending'
+        && getAfter(bookingPath).data.mentee_user_id == request.auth.uid
+        && getAfter(bookingPath).data.mentor_user_id == resource.data.mentor_user_id
+        && getAfter(bookingPath).data.schedule_id == scheduleId
+        && getAfter(bookingPath).data.start_time == resource.data.start_time
+        && getAfter(bookingPath).data.end_time == resource.data.end_time
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['availability_status', 'current_booking_id']);
+    }
+    function booksSlotForBooking(scheduleId) {
+      let bookingId = resource.data.current_booking_id;
+      let bookingPath = /databases/$(database)/documents/bookings/$(bookingId);
+      let booking = get(bookingPath);
+      let updatedBooking = getAfter(bookingPath);
+      return isVerifiedMentor()
+        && bookingId is string
+        && resource.data.mentor_user_id == request.auth.uid
+        && resource.data.availability_status == 'held'
+        && request.resource.data.availability_status == 'booked'
+        && request.resource.data.current_booking_id == bookingId
+        && booking.data.schedule_id == scheduleId
+        && booking.data.booking_status == 'pending'
+        && booking.data.expires_at is timestamp
+        && booking.data.expires_at > request.time
+        && booking.data.mentor_user_id == request.auth.uid
+        && updatedBooking.data.booking_status == 'confirmed'
+        && updatedBooking.data.mentor_user_id == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['availability_status']);
+    }
+    function releasesSlotForBooking(scheduleId) {
+      let bookingId = resource.data.current_booking_id;
+      let bookingPath = /databases/$(database)/documents/bookings/$(bookingId);
+      let booking = get(bookingPath);
+      let updatedBooking = getAfter(bookingPath);
+      return signedIn()
+        && bookingId is string
+        && resource.data.availability_status in ['held', 'booked']
+        && booking.data.schedule_id == scheduleId
+        && (
+          (
+            updatedBooking.data.booking_status == 'expired'
+            && booking.data.booking_status == 'pending'
+            && booking.data.expires_at is timestamp
+            && booking.data.expires_at < request.time
+            && (
+              booking.data.mentee_user_id == request.auth.uid
+              || booking.data.mentor_user_id == request.auth.uid
+            )
+          )
+          || (
+            updatedBooking.data.booking_status == 'rejected'
+            && booking.data.booking_status == 'pending'
+            && isVerifiedMentor()
+            && booking.data.mentor_user_id == request.auth.uid
+          )
+          || (
+            updatedBooking.data.booking_status == 'cancelled'
+            && isMentee()
+            && booking.data.mentee_user_id == request.auth.uid
+          )
+        )
+        && request.resource.data.mentor_user_id == resource.data.mentor_user_id
+        && request.resource.data.availability_status == 'available'
+        && !request.resource.data.keys().hasAny(['current_booking_id'])
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['availability_status', 'current_booking_id']);
+    }
+    function createsBookingForSlot(bookingId) {
+      let scheduleId = request.resource.data.schedule_id;
+      let slotPath = bookingSlotPath(scheduleId);
+      let mentorPath = /databases/$(database)/documents/mentor_profiles/$(request.resource.data.mentor_user_id);
+      let slot = get(slotPath);
+      let updatedSlot = getAfter(slotPath);
+      return isMentee()
+        && scheduleId is string
+        && exists(slotPath)
+        && slot.data.availability_status == 'available'
+        && slot.data.start_time > request.time
+        && slot.data.mentor_user_id == request.resource.data.mentor_user_id
+        && existsAfter(slotPath)
+        && updatedSlot.data.availability_status == 'held'
+        && updatedSlot.data.current_booking_id == bookingId
+        && updatedSlot.data.mentor_user_id == slot.data.mentor_user_id
+        && request.resource.data.mentee_user_id == request.auth.uid
+        && request.resource.data.mentee_name
+          == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.name
+        && exists(mentorPath)
+        && get(mentorPath).data.verification_status == 'verified'
+        && request.resource.data.mentor_name == get(mentorPath).data.name
+        && request.resource.data.booking_status == 'pending'
+        && request.resource.data.start_time == slot.data.start_time
+        && request.resource.data.end_time == slot.data.end_time
+        && request.resource.data.requested_at is timestamp
+        && request.resource.data.requested_at <= request.time
+        && request.resource.data.expires_at is timestamp
+        && request.resource.data.expires_at > request.time
+        && request.resource.data.expires_at
+          <= request.resource.data.requested_at + duration.value(31, 'm');
+    }
+    function approvesBooking(bookingId) {
+      let slotPath = bookingSlotPath(resource.data.schedule_id);
+      let slot = get(slotPath);
+      let updatedSlot = getAfter(slotPath);
+      return isVerifiedMentor()
+        && resource.data.mentor_user_id == request.auth.uid
+        && resource.data.booking_status == 'pending'
+        && resource.data.expires_at > request.time
+        && request.resource.data.booking_status == 'confirmed'
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['booking_status'])
+        && exists(slotPath)
+        && slot.data.availability_status == 'held'
+        && slot.data.current_booking_id == bookingId
+        && existsAfter(slotPath)
+        && updatedSlot.data.availability_status == 'booked'
+        && updatedSlot.data.current_booking_id == bookingId
+        && updatedSlot.data.diff(slot.data).affectedKeys()
+          .hasOnly(['availability_status']);
+    }
+    function rejectsBooking(bookingId) {
+      return isVerifiedMentor()
+        && resource.data.mentor_user_id == request.auth.uid
+        && resource.data.booking_status == 'pending'
+        && request.resource.data.booking_status == 'rejected'
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['booking_status', 'rejection_reason'])
+        && request.resource.data.rejection_reason is string
+        && heldSlotReleased(bookingId);
+    }
+    function cancelsBooking(bookingId) {
+      return isMentee()
+        && resource.data.mentee_user_id == request.auth.uid
+        && request.resource.data.booking_status == 'cancelled'
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['booking_status'])
+        && (
+          (
+            resource.data.booking_status == 'pending'
+            && resource.data.expires_at is timestamp
+            && resource.data.expires_at > request.time
+          )
+          || (
+            resource.data.booking_status == 'confirmed'
+            && resource.data.start_time is timestamp
+            && resource.data.start_time
+              >= request.time + duration.value(24, 'h')
+          )
+        )
+        && heldSlotReleased(bookingId);
+    }
+    function expiresBooking(bookingId) {
+      return signedIn()
+        && (
+          resource.data.mentee_user_id == request.auth.uid
+          || resource.data.mentor_user_id == request.auth.uid
+        )
+        && resource.data.booking_status == 'pending'
+        && resource.data.expires_at is timestamp
+        && resource.data.expires_at < request.time
+        && request.resource.data.booking_status == 'expired'
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['booking_status'])
+        && heldSlotReleased(bookingId);
+    }
+    function completesBooking() {
+      return isVerifiedMentor()
+        && resource.data.mentor_user_id == request.auth.uid
+        && resource.data.booking_status == 'confirmed'
+        && resource.data.start_time is timestamp
+        && resource.data.start_time <= request.time
+        && request.resource.data.booking_status == 'completed'
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['booking_status']);
+    }
+    function bookingContactVisible(bookingId) {
+      let bookingPath = /databases/$(database)/documents/bookings/$(bookingId);
+      return signedIn()
+        && exists(bookingPath)
+        && get(bookingPath).data.booking_status in ['confirmed', 'completed']
+        && (
+          get(bookingPath).data.mentee_user_id == request.auth.uid
+          || get(bookingPath).data.mentor_user_id == request.auth.uid
+          || isAdmin()
+        );
+    }
+    function createsBookingContact(bookingId) {
+      let bookingPath = /databases/$(database)/documents/bookings/$(bookingId);
+      let userPath = /databases/$(database)/documents/users/$(request.auth.uid);
+      let mentorContact = mentorContactPath(request.auth.uid);
+      return request.resource.data.keys().hasOnly([
+          'mentee_user_id', 'mentor_user_id', 'mentee_email',
+          'mentee_whatsapp', 'mentor_whatsapp'
+        ])
+        && (
+          (
+            isMentee()
+            &&
+            existsAfter(bookingPath)
+            && getAfter(bookingPath).data.booking_status == 'pending'
+            && getAfter(bookingPath).data.mentee_user_id == request.auth.uid
+            && getAfter(bookingPath).data.mentor_user_id
+              == request.resource.data.mentor_user_id
+            && request.resource.data.mentee_user_id == request.auth.uid
+            && request.resource.data.mentee_email is string
+            && request.resource.data.mentee_email == request.auth.token.email
+            && request.resource.data.mentee_whatsapp is string
+            && request.resource.data.mentee_whatsapp
+              == get(userPath).data.get('whatsapp', '')
+            && request.resource.data.mentor_whatsapp == ''
+          )
+          || (
+            isMentee()
+            &&
+            exists(bookingPath)
+            && get(bookingPath).data.booking_status in ['confirmed', 'completed']
+            && get(bookingPath).data.mentee_user_id == request.auth.uid
+            && get(bookingPath).data.mentor_user_id
+              == request.resource.data.mentor_user_id
+            && request.resource.data.mentee_user_id == request.auth.uid
+            && request.resource.data.mentee_email is string
+            && request.resource.data.mentee_email == request.auth.token.email
+            && request.resource.data.mentee_whatsapp is string
+            && request.resource.data.mentee_whatsapp
+              == get(userPath).data.get('whatsapp', '')
+            && request.resource.data.mentor_whatsapp == ''
+          )
+          || (
+            isVerifiedMentor()
+            && exists(bookingPath)
+            && get(bookingPath).data.booking_status in ['confirmed', 'completed']
+            && get(bookingPath).data.mentor_user_id == request.auth.uid
+            && request.resource.data.mentee_user_id
+              == get(bookingPath).data.mentee_user_id
+            && request.resource.data.mentor_user_id == request.auth.uid
+            && request.resource.data.mentee_email == ''
+            && request.resource.data.mentee_whatsapp == ''
+            && request.resource.data.mentor_whatsapp
+              == (exists(mentorContact)
+                ? get(mentorContact).data.get('phone', '')
+                : '')
+          )
+        );
+    }
+    function updatesBookingContactForApproval(bookingId) {
+      let bookingPath = /databases/$(database)/documents/bookings/$(bookingId);
+      let contactPath = mentorContactPath(request.auth.uid);
+      return isVerifiedMentor()
+        && resource.data.mentor_user_id == request.auth.uid
+        && resource.data.mentee_user_id
+          == get(bookingPath).data.mentee_user_id
+        && get(bookingPath).data.booking_status == 'pending'
+        && getAfter(bookingPath).data.booking_status == 'confirmed'
+        && getAfter(bookingPath).data.mentor_user_id == request.auth.uid
+        && request.resource.data.mentor_user_id == resource.data.mentor_user_id
+        && request.resource.data.mentee_user_id == resource.data.mentee_user_id
+        && request.resource.data.mentee_email == resource.data.mentee_email
+        && request.resource.data.mentee_whatsapp == resource.data.mentee_whatsapp
+        && request.resource.data.mentor_whatsapp
+          == (exists(contactPath)
+            ? get(contactPath).data.get('phone', '')
+            : '')
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['mentor_whatsapp']);
+    }
+    function updatesBookingContactAfterApproval(bookingId) {
+      let bookingPath = /databases/$(database)/documents/bookings/$(bookingId);
+      let contactPath = mentorContactPath(request.auth.uid);
+      return isVerifiedMentor()
+        && exists(bookingPath)
+        && get(bookingPath).data.booking_status in ['confirmed', 'completed']
+        && get(bookingPath).data.mentor_user_id == request.auth.uid
+        && resource.data.mentor_user_id == request.auth.uid
+        && request.resource.data.mentor_user_id == resource.data.mentor_user_id
+        && request.resource.data.mentee_user_id == resource.data.mentee_user_id
+        && request.resource.data.mentee_email == resource.data.mentee_email
+        && request.resource.data.mentee_whatsapp == resource.data.mentee_whatsapp
+        && request.resource.data.mentor_whatsapp
+          == (exists(contactPath)
+            ? get(contactPath).data.get('phone', '')
+            : '')
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['mentor_whatsapp']);
+    }
+    function updatesBookingContactForMentee(bookingId) {
+      let bookingPath = /databases/$(database)/documents/bookings/$(bookingId);
+      let userPath = /databases/$(database)/documents/users/$(request.auth.uid);
+      return isMentee()
+        && exists(bookingPath)
+        && get(bookingPath).data.booking_status in ['confirmed', 'completed']
+        && get(bookingPath).data.mentee_user_id == request.auth.uid
+        && request.resource.data.mentee_user_id == request.auth.uid
+        && request.resource.data.mentor_user_id == resource.data.mentor_user_id
+        && request.resource.data.mentee_email == request.auth.token.email
+        && request.resource.data.mentee_whatsapp
+          == get(userPath).data.get('whatsapp', '')
+        && request.resource.data.mentor_whatsapp == resource.data.mentor_whatsapp
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['mentee_email', 'mentee_whatsapp']);
+    }
+
+    // ---------- users ----------
+    match /users/{uid} {
+      allow get: if isOwner(uid) || isAdmin();
+      allow list: if isAdmin();
+      // Registrasi: hanya boleh mentee/mentor (admin dibuat manual di Console)
+      allow create: if isOwner(uid)
+        && request.resource.data.role in ['mentee', 'mentor']
+        && request.resource.data.keys().hasOnly([
+          'name', 'email', 'role', 'whatsapp', 'created_at'
+        ])
+        && request.resource.data.name is string
+        && (!request.resource.data.keys().hasAny(['whatsapp'])
+          || request.resource.data.whatsapp is string)
+        && request.resource.data.name.size() > 0;
+      // Pengguna tidak boleh mengubah role sendiri
+      allow update: if (isOwner(uid) && request.resource.data.role == resource.data.role)
+        || isAdmin();
+      allow delete: if false;
+    }
+
+    // ---------- mentor_profiles (doc id = uid mentor) ----------
+    match /mentor_profiles/{uid} {
+      allow get: if isOwner(uid) || isAdmin();
+      allow list: if isAdmin();
+      // Dibuat bersamaan (batch) dengan dokumen users saat registrasi mentor,
+      // sehingga role dibaca dari kondisi SETELAH batch (getAfter).
+      allow create: if isOwner(uid)
+        && getAfter(/databases/$(database)/documents/users/$(uid)).data.role == 'mentor'
+        && request.resource.data.verification_status == 'pending';
+      // Mentor boleh edit profil, TIDAK boleh menyentuh field verifikasi
+      allow update: if (isOwner(uid) && isMentor()
+          && !request.resource.data.diff(resource.data).affectedKeys()
+              .hasAny(['verification_status', 'rejection_reason', 'verified_at', 'rejected_at']))
+        || isAdmin();
+      allow delete: if false;
+    }
+
+    // Profil publik terpisah dari kontak pribadi mentor.
+    match /mentor_public_profiles/{uid} {
+      allow get, list: if isOwner(uid) || isAdmin()
+        || (signedIn() && resource.data.verification_status == 'verified');
+      allow create: if isAdmin()
+        || (isOwner(uid) && isMentor()
+          && validPublicMentorProfile(request.resource.data)
+          && request.resource.data.verification_status
+            == getAfter(/databases/$(database)/documents/mentor_profiles/$(uid))
+              .data.verification_status);
+      allow update: if isAdmin()
+        || (isOwner(uid) && isMentor()
+          && validPublicMentorProfile(request.resource.data)
+          && request.resource.data.verification_status
+            == resource.data.verification_status);
+      allow delete: if false;
+    }
+
+    match /mentor_contact_profiles/{uid} {
+      allow get: if isOwner(uid) || isAdmin();
+      allow list: if isAdmin();
+      allow create, update: if isAdmin()
+        || (isOwner(uid) && isMentor()
+          && request.resource.data.keys().hasOnly([
+            'phone', 'email', 'linkedin', 'updated_at'
+          ])
+          && request.resource.data.phone is string
+          && request.resource.data.email is string
+          && request.resource.data.linkedin is string);
+      allow delete: if false;
+    }
+
+    // ---------- scholarships ----------
+    function validScholarship(d) {
+      return d.title is string && d.title.size() > 0
+        && d.organizer is string
+        && d.deadline is timestamp
+        && d.status in ['published', 'archived'];
+    }
+    match /scholarships/{id} {
+      // Mentee/Mentor hanya melihat yang published (query wajib where status == 'published')
+      allow read: if signedIn() && (resource.data.status == 'published' || isAdmin());
+      allow create, update: if isAdmin() && validScholarship(request.resource.data);
+      allow delete: if false;   // "hapus" = archived
+    }
+
+    // ---------- bookmarks (doc id = uid_scholarshipId -> otomatis unik) ----------
+    match /bookmarks/{id} {
+      allow get: if signedIn() && id.matches('^' + request.auth.uid + '_.*$');
+      allow list: if signedIn() && resource.data.user_id == request.auth.uid;
+      allow create: if isMentee()
+        && request.resource.data.user_id == request.auth.uid
+        && id == request.auth.uid + '_' + request.resource.data.scholarship_id;
+      allow delete: if signedIn() && resource.data.user_id == request.auth.uid;
+      allow update: if false;
+    }
+
+    // ---------- trackers (doc id = uid_scholarshipId -> satu tracker per beasiswa) ----------
+    match /trackers/{id} {
+      allow get: if signedIn() && id.matches('^' + request.auth.uid + '_.*$');
+      allow list: if signedIn() && resource.data.user_id == request.auth.uid;
+      allow create: if isMentee()
+        && request.resource.data.user_id == request.auth.uid
+        && id == request.auth.uid + '_' + request.resource.data.scholarship_id;
+      allow update: if signedIn() && resource.data.user_id == request.auth.uid
+        && request.resource.data.user_id == resource.data.user_id
+        && request.resource.data.scholarship_id == resource.data.scholarship_id;
+      allow delete: if false;
+    }
+
+    // ---------- tracker_documents ----------
+    match /tracker_documents/{id} {
+      allow read: if signedIn() && resource.data.user_id == request.auth.uid;
+      allow create: if isMentee() && request.resource.data.user_id == request.auth.uid;
+      allow update: if signedIn() && resource.data.user_id == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['completion_status']);
+      allow delete: if false;
+    }
+
+    // ---------- mentor_schedules ----------
+    // Booking expiry may release only the slot held by that booking.
+    match /mentor_schedules/{id} {
+      allow read: if signedIn();
+      allow create: if isVerifiedMentor()
+        && request.resource.data.mentor_user_id == request.auth.uid
+        && request.resource.data.availability_status == 'available'
+        && request.resource.data.start_time is timestamp
+        && request.resource.data.end_time is timestamp
+        && request.resource.data.end_time > request.resource.data.start_time
+        && request.resource.data.start_time > request.time;
+      // Mentor hanya boleh available <-> inactive; slot held/booked tidak bisa disentuh
+      allow update: if (
+          isVerifiedMentor()
+          && resource.data.mentor_user_id == request.auth.uid
+          && request.resource.data.mentor_user_id == resource.data.mentor_user_id
+          && resource.data.availability_status in ['available', 'inactive']
+          && request.resource.data.availability_status in ['available', 'inactive']
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['availability_status'])
+        )
+        || booksSlotForBooking(id)
+        || reservesSlotForBooking(id)
+        || releasesSlotForBooking(id);
+      allow delete: if false;
+    }
+
+    // ---------- bookings ----------
+    match /bookings/{id} {
+      allow read: if signedIn() && (
+        resource.data.mentee_user_id == request.auth.uid ||
+        resource.data.mentor_user_id == request.auth.uid ||
+        isAdmin());
+      allow create: if createsBookingForSlot(id);
+      allow update: if expiresBooking(id)
+        || approvesBooking(id)
+        || rejectsBooking(id)
+        || cancelsBooking(id)
+        || completesBooking();
+      allow delete: if false;
+    }
+
+    // Informasi kontak baru dapat dibaca setelah booking disetujui.
+    match /booking_contacts/{bookingId} {
+      allow get: if bookingContactVisible(bookingId);
+      allow list: if false;
+      allow create: if createsBookingContact(bookingId);
+      allow update: if updatesBookingContactForApproval(bookingId)
+        || updatesBookingContactAfterApproval(bookingId)
+        || updatesBookingContactForMentee(bookingId);
+      allow delete: if false;
+    }
+  }
+}

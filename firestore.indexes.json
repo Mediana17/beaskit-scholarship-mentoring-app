@@ -1,0 +1,28 @@
+{
+  "indexes": [
+    { "collectionGroup": "bookings", "queryScope": "COLLECTION",
+      "fields": [ { "fieldPath": "booking_status", "order": "ASCENDING" },
+                  { "fieldPath": "expires_at", "order": "ASCENDING" } ] },
+    { "collectionGroup": "bookings", "queryScope": "COLLECTION",
+      "fields": [ { "fieldPath": "mentee_user_id", "order": "ASCENDING" },
+                  { "fieldPath": "booking_status", "order": "ASCENDING" },
+                  { "fieldPath": "expires_at", "order": "ASCENDING" } ] },
+    { "collectionGroup": "bookings", "queryScope": "COLLECTION",
+      "fields": [ { "fieldPath": "mentor_user_id", "order": "ASCENDING" },
+                  { "fieldPath": "booking_status", "order": "ASCENDING" },
+                  { "fieldPath": "expires_at", "order": "ASCENDING" } ] },
+    { "collectionGroup": "bookings", "queryScope": "COLLECTION",
+      "fields": [ { "fieldPath": "booking_status", "order": "ASCENDING" },
+                  { "fieldPath": "end_time", "order": "ASCENDING" } ] },
+    { "collectionGroup": "bookings", "queryScope": "COLLECTION",
+      "fields": [ { "fieldPath": "mentee_user_id", "order": "ASCENDING" },
+                  { "fieldPath": "requested_at", "order": "DESCENDING" } ] },
+    { "collectionGroup": "bookings", "queryScope": "COLLECTION",
+      "fields": [ { "fieldPath": "mentor_user_id", "order": "ASCENDING" },
+                  { "fieldPath": "requested_at", "order": "DESCENDING" } ] },
+    { "collectionGroup": "mentor_schedules", "queryScope": "COLLECTION",
+      "fields": [ { "fieldPath": "mentor_user_id", "order": "ASCENDING" },
+                  { "fieldPath": "start_time", "order": "ASCENDING" } ] }
+  ],
+  "fieldOverrides": []
+}
